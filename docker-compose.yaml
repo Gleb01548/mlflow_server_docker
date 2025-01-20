@@ -1,83 +1,108 @@
-# version: '3.7'
-services:
-  # PostgreSQL database
-  postgres:
-    image: postgres:latest
-    container_name: postgres_mlflow
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    ports:
-      - 5432:5432
-    volumes:
-      - ./postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user -d mlflowdb"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - mlflow-network
+version: "3.3"
 
-  minio:
-    image: minio/minio
-    container_name: minio_mlflow
+services:
+  db:
+    restart: always
+    image: postgres
+    container_name: mlflow_db
     expose:
-      - "9000"
-    ports:
-      - "9000:9000"
-      # MinIO Console is available at http://localhost:9001
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    healthcheck:
-      test: timeout 5s bash -c ':> /dev/tcp/127.0.0.1/9000' || exit 1
-      interval: 1s
-      timeout: 10s
-      retries: 5
-    command: server /data --console-address ":9001"
+      - "${PG_PORT}"
     networks:
-      - mlflow-network
-  # Create a bucket named "bucket" if it doesn't exist
+      - backend
+    environment:
+      - POSTGRES_USER=${PG_USER}
+      - POSTGRES_PASSWORD=${PG_PASSWORD}
+      - POSTGRES_DATABASE=${PG_DATABASE}
+    volumes:
+      - ./volumes/db_data:/var/lib/postgresql/data/
+    healthcheck:
+      test: ["CMD", "pg_isready", "-p", "${PG_PORT}", "-U", "${PG_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+
+  s3:
+    restart: always
+    image: minio/minio
+    container_name: mlflow_minio
+    volumes:
+      - ./volumes/minio_data:/data
+    ports:
+      - "${MINIO_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    networks:
+      - frontend
+      - backend
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_ADDRESS=${MINIO_ADDRESS}
+      - MINIO_PORT=${MINIO_PORT}
+      - MINIO_STORAGE_USE_HTTPS=${MINIO_STORAGE_USE_HTTPS}
+      - MINIO_CONSOLE_ADDRESS=${MINIO_CONSOLE_ADDRESS}
+    command: server /data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
   minio-create-bucket:
     image: minio/mc
     depends_on:
-      minio:
+      s3:
         condition: service_healthy
     entrypoint: >
-      bash -c "
-      mc alias set minio http://minio:9000 minio_user minio_password &&
-      if ! mc ls minio | grep --quiet bucket; then
-        mc mb minio/bucket
-      else
-        echo 'bucket already exists'
-      fi
-      "
+        bash -c "
+        mc alias set minio http://s3:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+        if ! mc ls minio/${MLFLOW_BUCKET_NAME} > /dev/null 2>&1; then
+          mc mb minio/${MLFLOW_BUCKET_NAME} &&
+          echo 'Bucket ${MLFLOW_BUCKET_NAME} created successfully'
+        else
+          echo 'Bucket ${MLFLOW_BUCKET_NAME} already exists'
+        fi
+        "
     networks:
-      - mlflow-network
-  
-  mlflow:
+      - backend
+
+  tracking_server:
+    restart: always
     build: ./mlflow
     image: mlflow_server
-    container_name: mlflow_servers
+    container_name: mlflow_server
     depends_on:
-      postgres:
+      s3:
         condition: service_healthy
-      minio:
+      db:
         condition: service_healthy
-    environment:
-      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-      # BACKEND_STORE_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     ports:
-      - "5000:5000"
-    command: mlflow server --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB} --artifacts-destination ${ARTIFACTS_DESTINATION} --host 0.0.0.0
+      - "${MLFLOW_PORT}:5000"
     networks:
-      - mlflow-network
+      - frontend
+      - backend
+    environment:
+      - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_ACCESS_KEY}
+      - MLFLOW_S3_ENDPOINT_URL=http://s3:${MINIO_PORT}
+      - MLFLOW_S3_IGNORE_TLS=true
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://${PG_USER}:${PG_PASSWORD}@db:${PG_PORT}/${PG_DATABASE}
+      --host 0.0.0.0
+      --serve-artifacts
+      --artifacts-destination s3://${MLFLOW_BUCKET_NAME}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${MLFLOW_PORT}/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  db_data:
+  minio_data:
 
 networks:
-  mlflow-network:
-    name: mlflow-network
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
